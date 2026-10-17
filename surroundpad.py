@@ -1,12 +1,13 @@
-"""SurroundPad - play SurrounDead with an Xbox controller.
+"""SurroundPad - play SurrounDead with an Xbox (XInput) controller.
 
 SurrounDead has no controller support, so this reads the pad through XInput
 and presses the game's own keyboard and mouse controls. It only sends input
 while the SurrounDead window is in front, so it never types into anything else.
 
 Run:  py -3.12 surroundpad.py          (or double-click SurroundPad.bat)
-Edit bindings in bindings.ini next to this file; restart to apply.
-Back + Start together pauses / resumes it.
+A small always-on-top window lists the controls; closing it keeps the pad working.
+Hold LB for the second layer of buttons. Back + Start together pauses / resumes.
+Bindings live in bindings.ini next to this file; restart to apply.
 """
 import configparser
 import ctypes
@@ -14,10 +15,12 @@ import ctypes.wintypes as wt
 import math
 import os
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GAME_EXE = "surroundead"  # matched against the front window's process name
+CONFIG_VERSION = "2"
 
 # ---------------------------------------------------------------- XInput
 class XINPUT_GAMEPAD(ctypes.Structure):
@@ -42,6 +45,7 @@ BUTTON_BITS = {
     "Start": 0x0010, "Back": 0x0020, "L3": 0x0040, "R3": 0x0080,
     "LB": 0x0100, "RB": 0x0200, "A": 0x1000, "B": 0x2000, "X": 0x4000, "Y": 0x8000,
 }
+CONTROLS = ["A", "B", "X", "Y", "RB", "LT", "RT", "L3", "R3", "Back", "Start", "DUp", "DRight", "DDown", "DLeft"]
 
 # ---------------------------------------------------------------- SendInput
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -68,14 +72,15 @@ MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL = 0x1, 0x800
 # Scan codes (set 1). Extended keys carry 0xE000.
 SCAN = {
     "ESC": 0x01, "1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06, "6": 0x07, "7": 0x08, "8": 0x09,
-    "9": 0x0A, "0": 0x0B, "TAB": 0x0F, "Q": 0x10, "W": 0x11, "E": 0x12, "R": 0x13, "T": 0x14, "Y": 0x15,
-    "U": 0x16, "I": 0x17, "O": 0x18, "P": 0x19, "ENTER": 0x1C, "LCTRL": 0x1D, "A": 0x1E, "S": 0x1F,
-    "D": 0x20, "F": 0x21, "G": 0x22, "H": 0x23, "J": 0x24, "K": 0x25, "L": 0x26, "LSHIFT": 0x2A,
-    "Z": 0x2C, "X": 0x2D, "C": 0x2E, "V": 0x2F, "B": 0x30, "N": 0x31, "M": 0x32, "LALT": 0x38,
-    "SPACE": 0x39, "CAPS": 0x3A, "F1": 0x3B, "F2": 0x3C, "F3": 0x3D, "F4": 0x3E, "F5": 0x3F,
-    "F6": 0x40, "F7": 0x41, "F8": 0x42, "F9": 0x43, "F10": 0x44,
-    "UP": 0xE048, "DOWN": 0xE050, "LEFT": 0xE04B, "RIGHT": 0xE04D,
+    "9": 0x0A, "0": 0x0B, "MINUS": 0x0C, "EQUALS": 0x0D, "TAB": 0x0F, "Q": 0x10, "W": 0x11, "E": 0x12,
+    "R": 0x13, "T": 0x14, "Y": 0x15, "U": 0x16, "I": 0x17, "O": 0x18, "P": 0x19, "ENTER": 0x1C,
+    "LCTRL": 0x1D, "A": 0x1E, "S": 0x1F, "D": 0x20, "F": 0x21, "G": 0x22, "H": 0x23, "J": 0x24,
+    "K": 0x25, "L": 0x26, "SEMICOLON": 0x27, "LSHIFT": 0x2A, "BACKSLASH": 0x2B, "Z": 0x2C, "X": 0x2D,
+    "C": 0x2E, "V": 0x2F, "B": 0x30, "N": 0x31, "M": 0x32, "LALT": 0x38, "SPACE": 0x39, "CAPS": 0x3A,
+    "F1": 0x3B, "F2": 0x3C, "F3": 0x3D, "F4": 0x3E, "F5": 0x3F, "F6": 0x40, "F7": 0x41, "F8": 0x42,
+    "F9": 0x43, "F10": 0x44, "UP": 0xE048, "DOWN": 0xE050, "LEFT": 0xE04B, "RIGHT": 0xE04D,
 }
+WHEEL = ("WHEELUP", "WHEELDOWN")
 
 def send(*inputs):
     arr = (INPUT * len(inputs))(*inputs)
@@ -94,12 +99,10 @@ def mouse_input(dx=0, dy=0, flags=0, data=0):
     return i
 
 def press(action, down):
-    """action is a key name, LMB/RMB/MMB, WHEELUP/WHEELDOWN, or empty."""
-    if not action:
-        return
+    """action is a key name, LMB/RMB/MMB or WHEELUP/WHEELDOWN."""
     if action in MOUSE:
         send(mouse_input(flags=MOUSE[action][0 if down else 1]))
-    elif action in ("WHEELUP", "WHEELDOWN"):
+    elif action in WHEEL:
         if down:
             send(mouse_input(flags=MOUSEEVENTF_WHEEL, data=120 if action == "WHEELUP" else -120))
     else:
@@ -121,28 +124,48 @@ def front_exe():
     return os.path.basename(buf.value).lower() if ok else ""
 
 # ---------------------------------------------------------------- config
-DEFAULT_INI = """\
-; SurroundPad bindings. Values: a key (W, LSHIFT, SPACE, E, 1, F, TAB, ESC, ...),
+# Defaults follow SurrounDead's default keys (surroundead.wiki.gg/wiki/Controls).
+DEFAULT_INI = f"""\
+; SurroundPad bindings (version {CONFIG_VERSION}).
+; Format:  Button = KEY | label shown in the controls window
+; KEY is a key (W, LSHIFT, LCTRL, SPACE, TAB, F, 1, MINUS, EQUALS, ...),
 ; LMB / RMB / MMB, WHEELUP / WHEELDOWN, or empty for nothing.
-; If a button does the wrong thing, check the game's Controls menu and change it here.
+; Matches the game's default keys; if you rebind in the game, change it here too.
 
 [buttons]
-A = SPACE
-B = C
-X = R
-Y = E
-LB = Q
-RB = F
-LT = RMB
-RT = LMB
-L3 = LSHIFT
-R3 = V
-Back = TAB
-Start = ESC
-DUp = 1
-DRight = 2
-DDown = 3
-DLeft = 4
+RT = LMB | Attack / fire
+LT = RMB | Aim
+A = SPACE | Jump / vault
+B = LCTRL | Crouch
+X = R | Reload
+Y = TAB | Inventory
+RB = F | Interact (the F prompt)
+L3 = LSHIFT | Sprint (stays on while moving)
+R3 = V | Shove / stomp
+DUp = 1 | Primary weapon
+DRight = 2 | Secondary weapon
+DDown = 3 | Sidearm
+DLeft = 4 | Melee weapon
+Back = M | Map
+Start = ESC | Pause menu
+
+; Hold LB, then press:
+[buttons_lb]
+RT = MMB | Scope zoom
+LT = G | Throwable
+A = C | Roll
+B = Z | Radial menu
+X = X | Fire mode
+Y = E | Loot all
+RB = L | Flashlight / car lights
+L3 = EQUALS | Auto walk
+R3 = T | Camera view
+DUp = N | Night vision
+DRight = B | Binoculars
+DDown = MINUS | Sit / rest
+DLeft = J | Journal
+Back = K | Weapon attachment
+Start = F5 | Quick save
 
 [sticks]
 ; left stick = these four keys
@@ -163,21 +186,51 @@ curve = 2.0
 invert_y = false
 deadzone = 0.15
 trigger_threshold = 0.25
+
+[window]
+; show the always-on-top controls list
+show = true
 """
+
+def _valid(v):
+    return not v or v in SCAN or v in MOUSE or v in WHEEL
 
 def load_config():
     path = os.path.join(HERE, "bindings.ini")
+    old = None
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        if f"(version {CONFIG_VERSION})" not in text:
+            old = path + ".old"
+            os.replace(path, old)
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write(DEFAULT_INI)
     cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
     cp.optionxform = str
     cp.read(path, encoding="utf-8")
-    buttons = {k: v.strip().upper() for k, v in cp["buttons"].items()}
-    for v in list(buttons.values()) + [cp["sticks"][k].strip().upper() for k in ("up", "down", "left", "right")]:
-        if v and v not in SCAN and v not in MOUSE and v not in ("WHEELUP", "WHEELDOWN"):
-            sys.exit(f"bindings.ini: unknown key '{v}'. Known: {', '.join(sorted(SCAN))}, LMB, RMB, MMB, WHEELUP, WHEELDOWN")
-    return cp, buttons, path
+    layers = {}
+    for sec in ("buttons", "buttons_lb"):
+        layer = {}
+        for k, v in cp[sec].items():
+            key, _, label = v.partition("|")
+            key = key.strip().upper()
+            if not _valid(key):
+                sys.exit(f"bindings.ini [{sec}] {k}: unknown key '{key}'. Known: {', '.join(sorted(SCAN))}, LMB, RMB, MMB, WHEELUP, WHEELDOWN")
+            layer[k] = (key, label.strip() or key)
+        layers[sec] = layer
+    if old:
+        print(f"Updated bindings.ini to the game's real keys (your previous file is {old}).")
+    return cp, layers, path
+
+# ---------------------------------------------------------------- shared state for the window
+class Shared:
+    lock = threading.Lock()
+    pressed = set()   # control names held right now
+    layer = "buttons"
+    status = "Starting..."
+    stop = False
 
 # ---------------------------------------------------------------- main loop
 def dead(v, dz):
@@ -185,22 +238,25 @@ def dead(v, dz):
     a = abs(v)
     return 0.0 if a < dz else math.copysign((a - dz) / (1 - dz), v)
 
-def main():
-    cp, buttons, path = load_config()
+def set_status(s):
+    with Shared.lock:
+        if Shared.status != s:
+            Shared.status = s
+            print(s)
+
+def run_pad(cp, layers):
     st, lk = cp["sticks"], cp["look"]
-    stick_keys = {"up": st["up"].strip().upper(), "down": st["down"].strip().upper(),
-                  "left": st["left"].strip().upper(), "right": st["right"].strip().upper()}
+    stick_keys = {k: st[k].strip().upper() for k in ("up", "down", "left", "right")}
     move_t = float(st["move_threshold"])
     sprint_toggle = st.getboolean("sprint_toggle")
     speed, curve = float(lk["speed"]), float(lk["curve"])
     inv = -1 if lk.getboolean("invert_y") else 1
     dz, trig_t = float(lk["deadzone"]), float(lk["trigger_threshold"])
 
-    print(f"SurroundPad running. Bindings: {path}")
-    print("Waiting for the controller and for SurrounDead to be in front. Back+Start pauses. Ctrl+C quits.")
-
-    held = set()           # actions currently held down by us
-    prev = {}              # control -> was pressed last frame
+    held = set()          # actions currently held down by us
+    carried = set()       # controls held through a layer change
+    last_layer = "buttons"
+    l3_prev = False
     sprint_latched = False
     paused = False
     combo_prev = False
@@ -208,26 +264,16 @@ def main():
     state = XINPUT_STATE()
     pad = -1
     last = time.perf_counter()
-    was_active = False
 
-    def release_all():
-        nonlocal sprint_latched
-        for a in list(held):
-            press(a, False)
-        held.clear()
-        prev.clear()
-        sprint_latched = False
+    def apply(wanted):
+        for a in list(held - wanted):
+            held.discard(a); press(a, False)
+        for a in wanted - held:
+            held.add(a); press(a, True)
 
-    def want(action, on):
-        if not action:
-            return
-        if on and action not in held:
-            held.add(action); press(action, True)
-        elif not on and action in held:
-            held.discard(action); press(action, False)
-
+    set_status("Waiting for the controller...")
     try:
-        while True:
+        while not Shared.stop:
             time.sleep(0.004)
             now = time.perf_counter()
             dt = min(0.05, now - last)
@@ -237,61 +283,81 @@ def main():
                 for i in range(4):
                     if xinput.XInputGetState(i, ctypes.byref(state)) == 0:
                         pad = i
-                        print(f"Controller {i + 1} connected.")
                         break
                 else:
+                    set_status("Waiting for the controller (turn it on in XInput mode)...")
                     time.sleep(0.5)
                     continue
             if xinput.XInputGetState(pad, ctypes.byref(state)) != 0:
-                print("Controller disconnected.")
                 pad = -1
-                release_all()
+                apply(set())
                 continue
             g = state.Gamepad
+            down = {n for n, bit in BUTTON_BITS.items() if g.wButtons & bit}
+            if g.bLeftTrigger / 255 > trig_t: down.add("LT")
+            if g.bRightTrigger / 255 > trig_t: down.add("RT")
+            layer_name = "buttons_lb" if "LB" in down else "buttons"
+            with Shared.lock:
+                Shared.pressed, Shared.layer = down, layer_name
 
-            combo = bool(g.wButtons & BUTTON_BITS["Back"]) and bool(g.wButtons & BUTTON_BITS["Start"])
+            combo = "Back" in down and "Start" in down
             if combo and not combo_prev:
                 paused = not paused
-                release_all()
-                print("Paused." if paused else "Resumed.")
+                apply(set())
+                sprint_latched = False
             combo_prev = combo
 
-            active = not paused and GAME_EXE in front_exe()
-            if active != was_active:
-                if not active:
-                    release_all()
-                print("SurrounDead in front - controller live." if active else "Not in SurrounDead - controller idle.")
-                was_active = active
-            if not active or combo:
+            if paused:
+                set_status("Paused (Back + Start to resume)")
+                continue
+            if GAME_EXE not in front_exe():
+                set_status("Controller connected - waiting for SurrounDead to be in front")
+                apply(set())
+                sprint_latched = False
+                continue
+            set_status("Live in SurrounDead")
+            if combo:
                 continue
 
-            # buttons
-            for name, bit in BUTTON_BITS.items():
-                if name in ("L3",):
+            layer = layers[layer_name]
+            # A button held while LB goes down/up keeps quiet until it's pressed again,
+            # so letting go of LB+A doesn't also jump.
+            if layer_name != last_layer:
+                carried = down - {"LB"}
+                last_layer = layer_name
+            carried &= down
+            wanted = set()
+            for c in CONTROLS:
+                if c == "L3" or c in carried:
                     continue
-                want(buttons.get(name, ""), bool(g.wButtons & bit))
-            want(buttons.get("LT", ""), g.bLeftTrigger / 255 > trig_t)
-            want(buttons.get("RT", ""), g.bRightTrigger / 255 > trig_t)
+                if c in down and layer.get(c, ("", ""))[0]:
+                    wanted.add(layer[c][0])
 
             # left stick -> movement keys
             lx, ly = dead(g.sThumbLX, dz), dead(g.sThumbLY, dz)
-            want(stick_keys["up"], ly > move_t)
-            want(stick_keys["down"], ly < -move_t)
-            want(stick_keys["right"], lx > move_t)
-            want(stick_keys["left"], lx < -move_t)
-
-            # L3 sprint: latch until the stick returns to centre
-            l3 = bool(g.wButtons & BUTTON_BITS["L3"])
             moving = abs(lx) > move_t or abs(ly) > move_t
-            if sprint_toggle:
-                if l3 and not prev.get("L3"):
+            for k, on in ((stick_keys["up"], ly > move_t), (stick_keys["down"], ly < -move_t),
+                          (stick_keys["right"], lx > move_t), (stick_keys["left"], lx < -move_t)):
+                if on and k:
+                    wanted.add(k)
+
+            # L3: sprint latch on the base layer, a normal button on the LB layer
+            l3 = "L3" in down
+            l3_key = layer.get("L3", ("", ""))[0]
+            if layer_name == "buttons" and sprint_toggle:
+                if l3 and not l3_prev:
                     sprint_latched = not sprint_latched
                 if not moving:
                     sprint_latched = False
-                want(buttons.get("L3", ""), sprint_latched)
-            else:
-                want(buttons.get("L3", ""), l3)
-            prev["L3"] = l3
+                if sprint_latched and l3_key:
+                    wanted.add(l3_key)
+            elif l3 and l3_key:
+                wanted.add(l3_key)
+            l3_prev = l3
+            if sprint_latched and layer_name == "buttons_lb":
+                wanted.add(layers["buttons"]["L3"][0])
+
+            apply(wanted)
 
             # right stick -> mouse movement (also moves the cursor in menus)
             rx, ry = dead(g.sThumbRX, dz), dead(g.sThumbRY, dz)
@@ -302,11 +368,94 @@ def main():
                 carry_x -= mx; carry_y -= my
                 if mx or my:
                     send(mouse_input(mx, my, MOUSEEVENTF_MOVE))
-    except KeyboardInterrupt:
-        pass
     finally:
-        release_all()
-        print("SurroundPad stopped.")
+        apply(set())
+
+# ---------------------------------------------------------------- controls window
+def run_window(layers, path):
+    import tkinter as tk
+
+    BG, FG, DIM, HI, ACC = "#16181d", "#e8e8e8", "#8a8f98", "#2d6cdf", "#f0b429"
+    root = tk.Tk()
+    root.title("SurroundPad controls")
+    root.configure(bg=BG)
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 0.97)
+    root.resizable(False, False)
+
+    status = tk.Label(root, text="", bg=BG, fg=ACC, font=("Segoe UI", 9, "bold"), anchor="w")
+    status.pack(fill="x", padx=10, pady=(8, 2))
+    tk.Label(root, text="Left stick: move    Right stick: look / cursor", bg=BG, fg=DIM,
+             font=("Segoe UI", 9), anchor="w").pack(fill="x", padx=10)
+
+    names = {"RT": "RT", "LT": "LT", "A": "A", "B": "B", "X": "X", "Y": "Y", "RB": "RB",
+             "L3": "L-stick click", "R3": "R-stick click", "DUp": "D-pad up", "DRight": "D-pad right",
+             "DDown": "D-pad down", "DLeft": "D-pad left", "Back": "Back", "Start": "Start"}
+    frame = tk.Frame(root, bg=BG)
+    frame.pack(padx=10, pady=6)
+    headers = [tk.Label(frame, text=t, bg=BG, fg=DIM, font=("Segoe UI", 9, "bold"), anchor="w")
+               for t in ("Button", "Normal", "Hold LB +")]
+    for i, h in enumerate(headers):
+        h.grid(row=0, column=i, sticky="w", padx=(0, 14))
+    cells = {}
+    for r, c in enumerate(CONTROLS, start=1):
+        tk.Label(frame, text=names[c], bg=BG, fg=FG, font=("Segoe UI", 9, "bold"), anchor="w").grid(
+            row=r, column=0, sticky="w", padx=(0, 14))
+        for col, layer in ((1, "buttons"), (2, "buttons_lb")):
+            key, label = layers[layer].get(c, ("", ""))
+            text = f"{label}  [{key.lower()}]" if key else "-"
+            lab = tk.Label(frame, text=text, bg=BG, fg=FG, font=("Segoe UI", 9), anchor="w", padx=4)
+            lab.grid(row=r, column=col, sticky="w", padx=(0, 10))
+            cells[(c, layer)] = lab
+    tk.Label(root, text="Back + Start: pause / resume.   Close this window to hide it; the pad keeps working.",
+             bg=BG, fg=DIM, font=("Segoe UI", 8), wraplength=430, justify="left").pack(padx=10, pady=(0, 2), anchor="w")
+    tk.Label(root, text=f"Edit keys in {path}", bg=BG, fg=DIM, font=("Segoe UI", 8),
+             wraplength=430, justify="left").pack(padx=10, pady=(0, 8), anchor="w")
+
+    # Top-right corner, out of the way of the game's centre.
+    root.update_idletasks()
+    root.geometry(f"+{root.winfo_screenwidth() - root.winfo_reqwidth() - 12}+40")
+
+    def tick():
+        with Shared.lock:
+            pressed, layer, s = set(Shared.pressed), Shared.layer, Shared.status
+        status.config(text=s)
+        headers[1].config(fg=ACC if layer == "buttons" else DIM)
+        headers[2].config(fg=ACC if layer == "buttons_lb" else DIM)
+        for (c, lay), lab in cells.items():
+            lab.config(bg=HI if (c in pressed and lay == layer) else BG)
+        root.after(50, tick)
+
+    tick()
+    root.mainloop()
+
+# ---------------------------------------------------------------- entry
+def main():
+    cp, layers, path = load_config()
+    print(f"SurroundPad running. Bindings: {path}")
+    print("Hold LB for the second layer. Back+Start pauses. Ctrl+C or close this terminal to quit.")
+    show = cp.getboolean("window", "show", fallback=True)
+    if show:
+        t = threading.Thread(target=run_pad, args=(cp, layers), daemon=True)
+        t.start()
+        try:
+            run_window(layers, path)
+        except Exception as e:
+            print(f"(controls window unavailable: {e})")
+        print("Controls window closed; the controller keeps working. Ctrl+C to quit.")
+        try:
+            while t.is_alive():
+                t.join(0.5)
+        except KeyboardInterrupt:
+            pass
+        Shared.stop = True
+        t.join(2)
+    else:
+        try:
+            run_pad(cp, layers)
+        except KeyboardInterrupt:
+            pass
+    print("SurroundPad stopped.")
 
 if __name__ == "__main__":
     main()
