@@ -8,6 +8,10 @@ Run `SurroundPad.bat` (needs Python 3.12 via the `py` launcher), then start the 
 A small always-on-top window lists every control and lights up what you're pressing;
 close it and the pad keeps working. Back + Start together pauses/resumes.
 
+While the game runs, `freeze_log.txt` gets a line every 10 s, and one a second whenever the game stops
+answering Windows (with its CPU, disk reads and memory), so a freeze shows whether the game hung,
+the whole PC stalled, or the controller dropped first.
+
 Keys follow the game's defaults from the [SurrounDead wiki](https://surroundead.wiki.gg/wiki/Controls).
 Bindings live in `bindings.ini` (created on first run; an older version is moved to `bindings.ini.old`).
 

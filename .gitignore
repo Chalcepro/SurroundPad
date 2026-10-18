@@ -1,3 +1,5 @@
 __pycache__/
 bindings.ini
 bindings.ini.old
+freeze_log.txt
+freeze_log.txt.old

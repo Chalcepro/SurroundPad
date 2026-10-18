@@ -230,6 +230,7 @@ class Shared:
     pressed = set()   # control names held right now
     layer = "buttons"
     status = "Starting..."
+    pad_on = False
     stop = False
 
 # ---------------------------------------------------------------- main loop
@@ -283,6 +284,7 @@ def run_pad(cp, layers):
                 for i in range(4):
                     if xinput.XInputGetState(i, ctypes.byref(state)) == 0:
                         pad = i
+                        Shared.pad_on = True
                         break
                 else:
                     set_status("Waiting for the controller (turn it on in XInput mode)...")
@@ -290,6 +292,7 @@ def run_pad(cp, layers):
                     continue
             if xinput.XInputGetState(pad, ctypes.byref(state)) != 0:
                 pad = -1
+                Shared.pad_on = False
                 apply(set())
                 continue
             g = state.Gamepad
@@ -371,6 +374,105 @@ def run_pad(cp, layers):
     finally:
         apply(set())
 
+# ---------------------------------------------------------------- freeze log
+# freeze_log.txt gets a line every 10 s while the game runs and a line a second while it
+# isn't answering Windows, so a freeze shows whether it was the game, the whole PC or the pad.
+LOG = os.path.join(HERE, "freeze_log.txt")
+psapi = ctypes.WinDLL("psapi")
+user32.SendMessageTimeoutW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT, wt.UINT,
+                                       ctypes.POINTER(ctypes.c_size_t)]
+user32.SendMessageTimeoutW.restype = wt.LPARAM
+
+class MEMSTAT(ctypes.Structure):
+    _fields_ = [("dwLength", wt.DWORD), ("load", wt.DWORD)] + [(n, ctypes.c_ulonglong) for n in (
+        "total", "avail", "pagetotal", "pageavail", "virttotal", "virtavail", "extavail")]
+
+class PMC(ctypes.Structure):
+    _fields_ = [("cb", wt.DWORD), ("faults", wt.DWORD)] + [(n, ctypes.c_size_t) for n in (
+        "peak_ws", "ws", "peak_paged", "paged", "peak_nonpaged", "nonpaged", "commit", "peak_commit")]
+
+class IOC(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_ulonglong) for n in ("rops", "wops", "oops", "rbytes", "wbytes", "obytes")]
+
+def log(msg):
+    line = f"{time.strftime('%m-%d %H:%M:%S')}  {msg}"
+    print(line)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def game_stats(proc, prev, dt):
+    """One-line snapshot of the game process and the PC, plus the counters for next time."""
+    t = [wt.FILETIME() for _ in range(4)]
+    kernel32.GetProcessTimes(proc, *[ctypes.byref(x) for x in t])
+    cpu = sum((x.dwHighDateTime << 32 | x.dwLowDateTime) / 1e7 for x in t[2:])
+    io = IOC(); kernel32.GetProcessIoCounters(proc, ctypes.byref(io))
+    pmc = PMC(cb=ctypes.sizeof(PMC)); psapi.GetProcessMemoryInfo(proc, ctypes.byref(pmc), pmc.cb)
+    ms = MEMSTAT(dwLength=ctypes.sizeof(MEMSTAT)); kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+    text = f"game mem {pmc.commit / 2**30:.1f}GB | RAM free {ms.avail / 2**30:.1f}GB ({ms.load}% used)"
+    if prev:
+        cpu_pct = (cpu - prev[0]) / dt / os.cpu_count() * 100
+        read = (io.rbytes - prev[1]) / dt / 2**20
+        text = f"game cpu {cpu_pct:.0f}% disk read {read:.1f}MB/s | " + text
+    return text, (cpu, io.rbytes)
+
+def run_watch():
+    if os.path.exists(LOG) and os.path.getsize(LOG) > 2 * 2**20:
+        os.replace(LOG, LOG + ".old")
+    hwnd = proc = 0
+    prev = None
+    hung_since = None
+    pad_was = Shared.pad_on
+    last = last_beat = time.time()
+    while not Shared.stop:
+        time.sleep(1)
+        now = time.time()
+        dt, last = now - last, now
+        if dt > 5:
+            log(f"WHOLE PC STALLED: this logger was frozen for {dt:.0f} s")
+        if Shared.pad_on != pad_was:
+            pad_was = Shared.pad_on
+            log("controller connected" if pad_was else "CONTROLLER DISCONNECTED")
+
+        if not proc:
+            if GAME_EXE not in front_exe():
+                continue
+            hwnd = user32.GetForegroundWindow()
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            proc = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not proc:
+                continue
+            prev = None
+            log(f"game found (pid {pid.value}), watching it")
+
+        code = wt.DWORD()
+        kernel32.GetExitCodeProcess(proc, ctypes.byref(code))
+        if code.value != 259:  # STILL_ACTIVE
+            log(f"game closed (exit code {code.value:#x})" + (f" while frozen for {now - hung_since:.0f} s" if hung_since else ""))
+            kernel32.CloseHandle(proc)
+            hwnd = proc = 0
+            hung_since = None
+            continue
+
+        res = ctypes.c_size_t()
+        t0 = time.perf_counter()
+        ok = user32.SendMessageTimeoutW(hwnd, 0, 0, 0, 0x2, 2000, ctypes.byref(res))  # WM_NULL, SMTO_ABORTIFHUNG
+        reply_ms = (time.perf_counter() - t0) * 1000
+        answering = ok and reply_ms < 2000
+        text, prev = game_stats(proc, prev, dt)
+        if not answering:
+            if hung_since is None:
+                hung_since = now
+                log(f"GAME STOPPED ANSWERING | pad {'on' if Shared.pad_on else 'OFF'} | {text}")
+            elif now - hung_since < 60 or int(now - hung_since) % 10 == 0:
+                log(f"  still frozen {now - hung_since:.0f} s | {text}")
+        elif hung_since is not None:
+            log(f"game answering again after {now - hung_since:.0f} s | {text}")
+            hung_since = None
+        elif now - last_beat >= 10:
+            last_beat = now
+            log(f"ok {reply_ms:.0f}ms | pad {'on' if Shared.pad_on else 'OFF'} | {text}")
+
 # ---------------------------------------------------------------- controls window
 def run_window(layers, path):
     import tkinter as tk
@@ -434,6 +536,8 @@ def main():
     cp, layers, path = load_config()
     print(f"SurroundPad running. Bindings: {path}")
     print("Hold LB for the second layer. Back+Start pauses. Ctrl+C or close this terminal to quit.")
+    print(f"Freeze log: {LOG}")
+    threading.Thread(target=run_watch, daemon=True).start()
     show = cp.getboolean("window", "show", fallback=True)
     if show:
         t = threading.Thread(target=run_pad, args=(cp, layers), daemon=True)
