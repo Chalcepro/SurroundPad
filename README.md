@@ -32,6 +32,3 @@ Bindings live in `bindings.ini` (created on first run; an older version is moved
 | Back | map (M) | weapon attachment (K) |
 | Start | pause menu (Esc) | quick save (F5) |
 
-## GooPad (World of Goo 2)
-
-Double-click `GooPad.bat`. Left stick moves the cursor, right stick moves it fast (push to an edge to look around), hold LT for slow precise moves, hold A to grab a goo ball, LB/RB zoom, Start = menu, Back+Start pauses. Only active while WorldOfGoo2.exe is in front. World of Goo 2 has its own controller support: if that works, do not run GooPad as well.
